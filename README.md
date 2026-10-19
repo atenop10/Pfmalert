@@ -1,62 +1,78 @@
-# Pocket FM Episode Alert Bot
+# Pocket FM Alert Bot
 
-A Telegram bot that watches Pocket FM series you choose and messages you when new episodes appear.
+Telegram bot that messages you when a Pocket FM show you follow gets new episodes.
 
-> **Status:** untested against the live Pocket FM site. Pocket FM has no public API, so the bot reads public show pages. Run `/debug` on a real show link first and tune `COUNT_KEYS` in `pocketfm_bot.py` if needed. Check Pocket FM's terms of service before running it, keep polling modest, and don't redistribute their content. This project is unofficial and not affiliated with Pocket FM.
+**Users:** `/follow <link>`, `/unfollow <link or number>`, `/list`, `/help`
+**Admins:** `/stats`, `/users`, `/userinfo`, `/shows`, `/broadcast`, `/ban`, `/unban`, `/removeshow`, `/forcecheck`, `/debug`, `/backup`, `/adminhelp`
 
-## Setup
+> Pocket FM has no public API. The bot reads the public show page and compares the episode count.
+> If a show can't be tracked, run `/debug <link>` as admin to see what the scraper finds, then adjust `COUNT_KEYS` in `pocketfm_bot.py`. Respect Pocket FM's terms of service.
 
-1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Easiest: run `bash setup.sh` then `bash run.sh`. It asks for your bot token and your Telegram user ID.
-   Manual alternative:
-   ```bash
-   export BOT_TOKEN="your-token"
-   export ADMIN_IDS="your-telegram-id"   # get it from @userinfobot
-   python pocketfm_bot.py
-   ```
+## Quick VPS setup (one command)
 
-## Commands
+```bash
+git clone https://github.com/YOUR_USERNAME/pocketfm-alert-bot.git
+cd pocketfm-alert-bot
+sudo bash setup.sh
+```
+It installs everything, asks for your bot token and admin ID, starts the bot as a service and schedules daily backups.
+Update later with `sudo bash /home/botuser/pocketfm-alert-bot/update.sh`.
+(Private repo? Use a clone URL with a deploy key or token.)
 
-**Public**
+## Manual VPS setup (Ubuntu/Debian)
 
-| Command | What it does |
-|---|---|
-| `/start`, `/help` | Intro and usage |
-| `/follow <series link>` | Start tracking a series (5 per user by default) |
-| `/unfollow <series link>` | Stop tracking it |
-| `/list` | Show what you follow and your limit |
-| `/requestmore [reason]` | Ask the admin for a higher limit |
+```bash
+# 1. As root: install tools and create a user
+apt update && apt install -y python3 python3-venv python3-pip git
+adduser --disabled-password --gecos "" botuser
 
-**Admin** (only IDs in `ADMIN_IDS`)
+# 2. As botuser: get the code
+su - botuser
+git clone https://github.com/YOUR_USERNAME/pocketfm-alert-bot.git
+cd pocketfm-alert-bot
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 
-| Command | What it does |
-|---|---|
-| `/adminhelp` | List admin commands |
-| `/stats` | Users, active/new 24h, shows, follows, alerts sent, errors, uptime |
-| `/users` | Recent users and follow counts |
-| `/shows` | Most followed and failing shows |
-| `/broadcast <text>` | Message all users |
-| `/setlimit <id> <n\|default>` | Set a user's series limit (the user is notified) |
-| `/forcesub on\|off` | Turn the channel requirement on or off |
-| `/ban <id>`, `/unban <id>` | Block or unblock a user |
-| `/debug <series link>` | Show what the scraper detects |
+# 3. Configure
+cp .env.example .env
+nano .env            # set BOT_TOKEN and ADMIN_IDS
+chmod 600 .env
+exit                 # back to root
 
-The bot checks every 5 minutes (`POLL_MINUTES`). Each series is fetched once per cycle no matter how many users follow it. Admins are warned if a series fails 10 checks in a row.
+# 4. Run as a service (auto-start on boot, auto-restart on crash)
+cp /home/botuser/pocketfm-alert-bot/pocketfm-bot.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now pocketfm-bot
+systemctl status pocketfm-bot
+journalctl -u pocketfm-bot -f      # live logs
+```
 
-## Force-subscribe
+### Update after pushing new code to GitHub
+```bash
+su - botuser -c "cd pocketfm-alert-bot && git pull && .venv/bin/pip install -r requirements.txt"
+systemctl restart pocketfm-bot
+```
 
-Users must join the channel in `FORCE_SUB_CHANNEL` (default `@audios_fm`) before using the bot, and alerts pause for anyone who leaves. **Add the bot as an administrator of the channel** (any permissions are fine) or it can't check membership. If the check fails, users are let through and admins are warned. Set `FORCE_SUB_CHANNEL=` (empty) to disable.
+### Daily backups
+```bash
+chmod +x /home/botuser/pocketfm-alert-bot/backup.sh
+su - botuser -c '(crontab -l 2>/dev/null; echo "0 3 * * * /home/botuser/pocketfm-alert-bot/backup.sh") | crontab -'
+```
+Or send yourself the DB any time with `/backup`.
 
-## Notes
+### Moving an older database
+Copy your old `pocketfm_bot.db` into the project folder before the first start. It is migrated automatically.
 
-- Episodes may be counted when added, not when unlocked for free.
-- If the page loads data via JavaScript, switch `fetch()` to Playwright.
-- Never commit your bot token. `.env` and `*.db` are git-ignored.
+## Configuration (.env)
 
-## License
+| Variable | Meaning | Default |
+|---|---|---|
+| `BOT_TOKEN` | Token from @BotFather | required |
+| `ADMIN_IDS` | Comma-separated Telegram user IDs | none |
+| `ALLOWED_CHAT_IDS` | If set, only these chats (+ admins) can use the bot | open |
+| `POLL_MINUTES` | How often shows are checked | 20 |
+| `MAX_FOLLOWS` | Max shows per user | 20 |
+| `NOTIFY_ON_START` | DM admins on startup (1/0) | 1 |
 
-MIT
+## Only run one copy
+Telegram allows one polling instance per token. If you see a `Conflict` error, stop the bot on your old host (Render, PC, etc.) first.

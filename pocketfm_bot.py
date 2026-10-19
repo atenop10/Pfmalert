@@ -1,18 +1,23 @@
 """
-Pocket FM episode alert bot for Telegram (public + admin version).
+Pocket FM Episode Alert Bot for Telegram.
 
-Public commands:  /start /help /follow /unfollow /list
-Admin commands:   /adminhelp /stats /users /shows /broadcast /ban /unban /debug
+Users:   /follow /unfollow /list /help
+Admins:  /stats /users /userinfo /shows /broadcast /ban /unban /removeshow
+         /forcecheck /debug /backup /adminhelp
 
-Config (environment variables, or .env loaded by run.sh):
-    BOT_TOKEN   token from @BotFather                (required)
-    ADMIN_IDS   your Telegram user ID(s), comma-sep  (required for admin cmds)
+Configuration (environment variables or a .env file next to this script):
+    BOT_TOKEN          required, from @BotFather
+    ADMIN_IDS          comma-separated Telegram user IDs allowed to use admin commands
+    ALLOWED_CHAT_IDS   optional, comma-separated. If set, only these chats (and admins) can use the bot
+    POLL_MINUTES       optional, default 20
+    MAX_FOLLOWS        optional, max shows per chat, default 20
+    NOTIFY_ON_START    optional, "1" (default) or "0": DM admins when the bot starts
 
-NOTE: Pocket FM has no public API, so this reads public show pages. It is
-untested against the live site: run /debug on a real show link first and tune
-COUNT_KEYS if the episode count isn't detected. Check Pocket FM's terms of
-service before running this publicly.
+NOTE: Pocket FM has no public API. The bot reads the public show page, so the
+episode-count detection may need tuning. Use /debug <link> (admin) to see what
+was found and adjust COUNT_KEYS below. Respect Pocket FM's terms of service.
 """
+
 import asyncio
 import functools
 import json
@@ -21,99 +26,187 @@ import os
 import re
 import sqlite3
 import time
-from urllib.parse import urlparse
+from contextlib import closing
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import Forbidden, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from requests.adapters import HTTPAdapter
+from telegram import BotCommand, BotCommandScopeChat, Update
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-# Users must join this channel to use the bot. The bot must be an ADMIN of the channel.
-# Set FORCE_SUB_CHANNEL="" to disable.
-FORCE_SUB_CHANNEL = os.environ.get("FORCE_SUB_CHANNEL", "@audios_fm")
-ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
-POLL_MINUTES = 5
-DEFAULT_FOLLOW_LIMIT = 5      # admins can raise this per user with /setlimit
-FETCH_DELAY_SECONDS = 1.5      # pause between show fetches (be polite to the site)
-FAILS_BEFORE_ADMIN_ALERT = 10
-DB_PATH = "pocketfm_bot.db"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; EpisodeAlertBot/1.0)"}
+try:  # optional: load a .env file next to this script
+    from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
+
+# ---------- config ----------
+
+def _ids(name: str) -> set:
+    raw = os.environ.get(name, "")
+    return {int(x) for x in raw.replace(" ", "").split(",") if x.lstrip("-").isdigit()}
+
+
+def _int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_IDS = _ids("ADMIN_IDS")
+ALLOWED_CHAT_IDS = _ids("ALLOWED_CHAT_IDS")
+POLL_MINUTES = _int("POLL_MINUTES", 20)
+MAX_FOLLOWS = _int("MAX_FOLLOWS", 20)
+NOTIFY_ON_START = os.environ.get("NOTIFY_ON_START", "1").strip() != "0"
+
+FETCH_DELAY_SECONDS = 2        # pause between show fetches while polling
+FAIL_ALERT_THRESHOLD = 10      # tell admins after this many failed checks in a row
+FOLLOW_COOLDOWN_SECONDS = 3    # per-chat cooldown for /follow
+DROP_CONFIRM_CHECKS = 3        # a lower episode count must repeat this many polls before we trust it
+MAX_SEND_LEN = 4000            # Telegram limit is 4096
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "pocketfm_bot.db")
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml",
+}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("pocketfm-bot")
-STARTED_AT = time.time()
+
+START_TIME = time.time()
+POLL_LOCK = asyncio.Lock()
+_follow_last_used: dict = {}
+
+_session = requests.Session()
+_session.headers.update(HEADERS)
+_session.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=2))
+_session.mount("http://", HTTPAdapter(pool_connections=2, pool_maxsize=2))
 
 
-# ---------------- storage ----------------
-def db():
-    con = sqlite3.connect(DB_PATH)
-    con.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id INTEGER PRIMARY KEY, username TEXT, first_seen INTEGER,
-            last_seen INTEGER, banned INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS follows (
-            chat_id INTEGER, url TEXT, PRIMARY KEY (chat_id, url));
-        CREATE TABLE IF NOT EXISTS shows (
-            url TEXT PRIMARY KEY, title TEXT, last_count INTEGER,
-            last_checked INTEGER DEFAULT 0, fails INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER);
-        """
+# ---------- storage ----------
+
+def _add_column(con, table: str, column: str, decl: str):
+    cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+    if column not in cols:
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def db() -> sqlite3.Connection:
+    """Open the DB, create tables, and migrate older schemas."""
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=15000")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS follows ("
+        "chat_id INTEGER, url TEXT, PRIMARY KEY (chat_id, url))"
     )
-    cols = [r[1] for r in con.execute("PRAGMA table_info(users)")]
-    if "follow_limit" not in cols:  # migration for older databases
-        con.execute("ALTER TABLE users ADD COLUMN follow_limit INTEGER")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS shows ("
+        "url TEXT PRIMARY KEY, title TEXT, last_count INTEGER)"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS users ("
+        "chat_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, "
+        "first_seen INTEGER, last_seen INTEGER, banned INTEGER DEFAULT 0)"
+    )
+    con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    # migrations for databases created by older versions
+    _add_column(con, "shows", "last_checked", "INTEGER")
+    _add_column(con, "shows", "fail_count", "INTEGER DEFAULT 0")
+    _add_column(con, "shows", "last_error", "TEXT")
+    _add_column(con, "shows", "drop_hits", "INTEGER DEFAULT 0")
+    _add_column(con, "users", "blocked", "INTEGER DEFAULT 0")
+    _add_column(con, "users", "commands_used", "INTEGER DEFAULT 0")
+    con.commit()
     return con
 
 
-def get_limit(con, chat_id):
-    r = con.execute("SELECT follow_limit FROM users WHERE chat_id=?", (chat_id,)).fetchone()
-    return r[0] if r and r[0] is not None else DEFAULT_FOLLOW_LIMIT
+def meta_get(con, key: str, default=0):
+    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
 
 
-def bump(con, key, n=1):
+def meta_set(con, key: str, value):
     con.execute(
-        "INSERT INTO meta VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = value + ?",
-        (key, n, n),
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)),
     )
 
 
-def meta(con, key):
-    r = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    return r[0] if r else 0
+def meta_inc(con, key: str, n: int = 1):
+    meta_set(con, key, int(meta_get(con, key, 0)) + n)
 
 
-# ---------------- scraping ----------------
+def now() -> int:
+    return int(time.time())
+
+
+# ---------- scraping ----------
+
+def valid(url: str) -> bool:
+    return bool(re.match(r"^https?://([a-z0-9-]+\.)?pocketfm\.com(/|$)", url, re.I))
+
+
+def normalize_url(url: str) -> str:
+    """Strip query, fragment and trailing slash so the same show always matches."""
+    p = urlsplit(url.strip())
+    return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path.rstrip("/"), "", ""))
+
+
+class FetchError(Exception):
+    pass
+
+
 def fetch(url: str) -> str:
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    if not is_pocketfm(r.url):
-        raise ValueError("redirected away from pocketfm.com")
-    return r.text
-
-
-def is_pocketfm(url: str) -> bool:
-    try:
-        u = urlparse(url)
-    except ValueError:
-        return False
-    host = (u.hostname or "").lower()
-    return u.scheme in ("http", "https") and (host == "pocketfm.com" or host.endswith(".pocketfm.com"))
-
-
-def normalize(url: str) -> str:
-    u = urlparse(url.strip())
-    return f"{u.scheme}://{u.netloc}{u.path}".rstrip("/")
+    """Blocking fetch with retries. Always call via asyncio.to_thread() from async code."""
+    last_err = "unknown error"
+    for attempt in range(3):
+        try:
+            r = _session.get(url, timeout=20, allow_redirects=True)
+        except requests.RequestException as e:
+            last_err = f"network error: {type(e).__name__}"
+            time.sleep(2 * (attempt + 1))
+            continue
+        if not valid(r.url):
+            raise FetchError(f"Redirected outside pocketfm.com: {r.url}")
+        if r.status_code in (403, 429, 503):
+            last_err = f"HTTP {r.status_code} (blocked or rate limited)"
+            time.sleep(5 * (attempt + 1))
+            continue
+        if r.status_code >= 500:
+            last_err = f"HTTP {r.status_code}"
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code == 404:
+            raise FetchError("HTTP 404 (show page not found)")
+        if r.status_code >= 400:
+            raise FetchError(f"HTTP {r.status_code}")
+        return r.text
+    raise FetchError(last_err)
 
 
 def _walk(obj, path=""):
+    """Yield (path, value) for every leaf in nested JSON."""
     if isinstance(obj, dict):
         for k, v in obj.items():
             yield from _walk(v, f"{path}.{k}" if path else k)
     elif isinstance(obj, list):
-        yield (path + "[]", len(obj))
+        yield (path + "[]", len(obj))  # list length is often the episode count
         for i, v in enumerate(obj[:3]):
             yield from _walk(v, f"{path}[{i}]")
     else:
@@ -121,521 +214,707 @@ def _walk(obj, path=""):
 
 
 def extract_json_blobs(html: str):
+    """Pull structured data embedded in the page (most reliable source)."""
     soup = BeautifulSoup(html, "html.parser")
     blobs = []
     nxt = soup.find("script", id="__NEXT_DATA__")
-    if nxt and nxt.string:
+    if nxt and (nxt.string or nxt.get_text()):
         try:
-            blobs.append(("__NEXT_DATA__", json.loads(nxt.string)))
+            blobs.append(("__NEXT_DATA__", json.loads(nxt.string or nxt.get_text())))
         except json.JSONDecodeError:
             pass
     for s in soup.find_all("script", type="application/ld+json"):
         try:
-            blobs.append(("ld+json", json.loads(s.string or "")))
+            blobs.append(("ld+json", json.loads(s.string or s.get_text() or "")))
         except json.JSONDecodeError:
             pass
     return soup, blobs
 
 
 COUNT_KEYS = re.compile(
-    r"(total_?episodes?|episodes?_?count|num_?episodes?|story_?count|numberOfEpisodes)", re.I
+    r"^(total_?episodes?|episodes?_?count|num_?episodes?|story_?count|numberOfEpisodes)$",
+    re.I,
 )
+TITLE_SUFFIX = re.compile(r"\s*[|\-–]\s*pocket\s*fm.*$", re.I)
+
+
+def clean_title(raw: str) -> str:
+    return TITLE_SUFFIX.sub("", raw or "").strip() or "Unknown show"
 
 
 def find_episode_info(html: str):
-    """Return (title, episode_count or None). Tune COUNT_KEYS after /debug."""
+    """
+    Returns (title, episode_count) or (title, None) if the count can't be found.
+
+    Order of trust: ld+json fields, then __NEXT_DATA__ fields (shallowest first,
+    so the main show wins over recommended shows), then visible text.
+    Tune COUNT_KEYS after running /debug.
+    """
     soup, blobs = extract_json_blobs(html)
-    title = soup.title.string.strip() if soup.title and soup.title.string else "Unknown show"
-    for _, blob in blobs:
+    raw_title = soup.title.string.strip() if soup.title and soup.title.string else ""
+    title = clean_title(raw_title)
+
+    candidates = []  # (source_rank, depth, count)
+    for name, blob in blobs:
+        rank = 0 if name == "ld+json" else 1
         for path, val in _walk(blob):
-            if COUNT_KEYS.search(path.split(".")[-1]) and isinstance(val, (int, float, str)):
+            last_key = re.sub(r"\[\d*\]$", "", path.split(".")[-1])
+            if COUNT_KEYS.match(last_key) and isinstance(val, (int, float, str)) and not isinstance(val, bool):
                 try:
-                    return title, int(val)
+                    n = int(float(str(val).replace(",", "")))
                 except (TypeError, ValueError):
                     continue
+                if n >= 0:
+                    candidates.append((rank, path.count(".") + path.count("["), n))
+    if candidates:
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        return title, candidates[0][2]
+
     m = re.search(r"(\d[\d,]*)\s+episodes?", soup.get_text(" ", strip=True), re.I)
     if m:
         return title, int(m.group(1).replace(",", ""))
     return title, None
 
 
-async def get_info(url: str):
-    html = await asyncio.to_thread(fetch, url)   # don't block the bot while fetching
-    return find_episode_info(html)
+# ---------- helpers ----------
+
+def fmt_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    parts = [f"{d}d"] if d else []
+    if h or d:
+        parts.append(f"{h}h")
+    parts.append(f"{m}m")
+    if not d and not h:
+        parts.append(f"{s}s")
+    return " ".join(parts)
 
 
-# ---------------- force subscribe ----------------
-_member_cache = {}        # user_id -> (timestamp, True); only positive results are cached
-_sub_warned = False       # warn admins once if the channel check itself is broken
+def fmt_ago(ts) -> str:
+    if not ts:
+        return "never"
+    return fmt_duration(max(0, now() - int(ts))) + " ago"
 
 
-def forcesub_enabled(con=None):
-    if not FORCE_SUB_CHANNEL:
-        return False
-    return meta(con or db(), "forcesub_off") == 0
+def is_admin(update: Update) -> bool:
+    return bool(update.effective_user and update.effective_user.id in ADMIN_IDS)
 
 
-def channel_url():
-    return "https://t.me/" + FORCE_SUB_CHANNEL.lstrip("@")
+async def reply(update: Update, text: str):
+    await update.message.reply_text(text[:MAX_SEND_LEN], disable_web_page_preview=True)
 
 
-async def is_member(bot, user_id, notify_ctx=None):
-    """True if the user is in the channel. Fails open if the check itself breaks."""
-    global _sub_warned
-    if user_id in ADMIN_IDS:
-        return True
-    cached = _member_cache.get(user_id)
-    if cached and time.time() - cached[0] < 600:
-        return True
-    try:
-        m = await bot.get_chat_member(FORCE_SUB_CHANNEL, user_id)
-    except TelegramError as e:
-        log.error("force-sub check failed (is the bot an admin of %s?): %s", FORCE_SUB_CHANNEL, e)
-        if notify_ctx and not _sub_warned:
-            _sub_warned = True
-            await notify_admins(
-                notify_ctx,
-                f"Force-sub check failed: {e}\nMake sure the bot is an ADMIN of {FORCE_SUB_CHANNEL}. "
-                "Until fixed, users are allowed through.",
-            )
-        return True  # fail open so a config problem doesn't lock everyone out
-    ok = m.status in ("member", "administrator", "creator") or (
-        m.status == "restricted" and getattr(m, "is_member", False)
-    )
-    if ok:
-        _member_cache[user_id] = (time.time(), True)
-    return ok
-
-
-def join_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Join channel", url=channel_url())],
-        [InlineKeyboardButton("I've joined", callback_data="checksub")],
-    ])
-
-
-async def checksub_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if await is_member(ctx.bot, q.from_user.id, ctx):
-        await q.answer("Thanks for joining!")
-        await q.edit_message_text("Verified! Send /help to get started.")
-    else:
-        await q.answer("You haven't joined yet. Join the channel first, then tap again.", show_alert=True)
-
-
-# ---------------- decorators ----------------
-def track(fn):
-    """Register/update the user and block banned users."""
+def registered(fn):
+    """Track the user, enforce bans and the optional allow-list."""
     @functools.wraps(fn)
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        u, chat = update.effective_user, update.effective_chat
-        con = db()
-        now = int(time.time())
-        con.execute(
-            "INSERT INTO users (chat_id, username, first_seen, last_seen) VALUES (?,?,?,?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET username=excluded.username, last_seen=excluded.last_seen",
-            (chat.id, u.username if u else None, now, now),
-        )
-        banned = con.execute("SELECT banned FROM users WHERE chat_id=?", (chat.id,)).fetchone()[0]
-        bump(con, "commands_total")
-        con.commit()
-        if banned:
+        if not update.message or not update.effective_chat:
             return
-        if fn.__name__ not in ("start", "help_cmd") and forcesub_enabled(con):
-            if not await is_member(ctx.bot, chat.id, ctx):
-                await update.effective_message.reply_text(
-                    f"To use this bot, please join our channel {FORCE_SUB_CHANNEL} first, "
-                    "then tap \"I've joined\".",
-                    reply_markup=join_keyboard(),
-                )
-                return
+        chat_id = update.effective_chat.id
+        user = update.effective_user
+        admin = is_admin(update)
+
+        with closing(db()) as con, con:
+            con.execute(
+                "INSERT INTO users (chat_id, username, first_name, first_seen, last_seen, commands_used) "
+                "VALUES (?,?,?,?,?,1) ON CONFLICT(chat_id) DO UPDATE SET "
+                "username=excluded.username, first_name=excluded.first_name, "
+                "last_seen=excluded.last_seen, blocked=0, "
+                "commands_used=COALESCE(commands_used,0)+1",
+                (chat_id, user.username if user else None, user.first_name if user else None, now(), now()),
+            )
+            banned = con.execute("SELECT banned FROM users WHERE chat_id=?", (chat_id,)).fetchone()[0]
+
+        if banned and not admin:
+            await reply(update, "You are not allowed to use this bot.")
+            return
+        if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS and not admin:
+            await reply(update, "Sorry, this bot is private.")
+            return
         return await fn(update, ctx)
     return wrapper
 
 
 def admin_only(fn):
     @functools.wraps(fn)
-    @track
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in ADMIN_IDS:
-            return  # silently ignore non-admins
+        if not is_admin(update):
+            return  # stay silent so regular users don't learn admin commands exist
         return await fn(update, ctx)
-    return wrapper
+    return registered(wrapper)
 
 
-# ---------------- public commands ----------------
-HELP = (
-    "Pocket FM Episode Alert Bot\n\n"
-    "I message you when new episodes appear for the series you follow.\n\n"
-    "Commands:\n"
-    "/follow <series link> - start tracking a series\n"
-    "/unfollow <series link> - stop tracking it\n"
-    "/list - see the series you follow and your limit\n"
-    "/requestmore - ask the admin for a higher limit\n"
-    "/help - show this message\n\n"
-    "How to get a link: open the series in the Pocket FM app, tap Share, "
-    "copy the link, and paste it after /follow.\n\n"
-    f"Limits: {DEFAULT_FOLLOW_LIMIT} series per person by default (more with admin approval). "
-    f"I check every {POLL_MINUTES} minutes.\n"
-    "This bot is unofficial and not affiliated with Pocket FM."
+async def safe_send(bot, chat_id: int, text: str) -> str:
+    """Send a message. Returns 'ok', 'blocked' (user left/blocked) or 'fail'."""
+    for _ in range(3):
+        try:
+            await bot.send_message(chat_id, text[:MAX_SEND_LEN])
+            return "ok"
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Forbidden:
+            return "blocked"
+        except BadRequest as e:
+            if "chat not found" in str(e).lower():
+                return "blocked"
+            log.warning("send to %s failed: %s", chat_id, e)
+            return "fail"
+        except NetworkError as e:
+            log.warning("network error sending to %s: %s", chat_id, e)
+            await asyncio.sleep(2)
+        except Exception as e:
+            log.warning("send to %s failed: %s", chat_id, e)
+            return "fail"
+    return "fail"
+
+
+async def notify_admins(bot, text: str):
+    for aid in ADMIN_IDS:
+        await safe_send(bot, aid, text)
+
+
+def drop_chat(chat_id: int):
+    """User blocked the bot: remove their follows (and orphaned shows) and mark them blocked."""
+    with closing(db()) as con, con:
+        con.execute("DELETE FROM follows WHERE chat_id=?", (chat_id,))
+        con.execute("UPDATE users SET blocked=1 WHERE chat_id=?", (chat_id,))
+        con.execute("DELETE FROM shows WHERE url NOT IN (SELECT url FROM follows)")
+
+
+# ---------- user commands ----------
+
+HELP_TEXT = (
+    "I message you when a followed Pocket FM show gets new episodes.\n\n"
+    "/follow <show link> - start tracking\n"
+    "/unfollow <link or number from /list> - stop tracking\n"
+    "/list - what you follow\n"
+    "/help - this message"
 )
 
 
-@track
-async def start(update, ctx):
-    if forcesub_enabled() and not await is_member(ctx.bot, update.effective_user.id, ctx):
-        await update.message.reply_text(
-            f"Welcome! To use this bot, please join our channel {FORCE_SUB_CHANNEL} first, "
-            "then tap \"I've joined\".",
-            reply_markup=join_keyboard(),
-        )
+@registered
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await reply(update, HELP_TEXT)
+
+
+@registered
+async def follow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args or not valid(ctx.args[0]):
+        await reply(update, "Usage: /follow https://pocketfm.com/show/...")
         return
-    await update.message.reply_text("Welcome!\n\n" + HELP)
-
-
-@track
-async def help_cmd(update, ctx):
-    await update.message.reply_text(HELP)
-
-
-@track
-async def follow(update, ctx):
-    if not ctx.args or not is_pocketfm(ctx.args[0]):
-        await update.message.reply_text("Usage: /follow https://pocketfm.com/show/...\nSend /help for more.")
-        return
-    url = normalize(ctx.args[0])
     chat_id = update.effective_chat.id
-    con = db()
-    if con.execute("SELECT 1 FROM follows WHERE chat_id=? AND url=?", (chat_id, url)).fetchone():
-        await update.message.reply_text("You're already following that series.")
+
+    last = _follow_last_used.get(chat_id, 0)
+    if time.time() - last < FOLLOW_COOLDOWN_SECONDS:
+        await reply(update, "Slow down a little and try again.")
         return
-    n = con.execute("SELECT COUNT(*) FROM follows WHERE chat_id=?", (chat_id,)).fetchone()[0]
-    limit = get_limit(con, chat_id)
-    if n >= limit:
-        await update.message.reply_text(
-            f"You've reached your limit of {limit} series. Use /unfollow to free a slot, "
-            "or /requestmore to ask the admin for a higher limit."
-        )
+    _follow_last_used[chat_id] = time.time()
+
+    url = normalize_url(ctx.args[0])
+    with closing(db()) as con:
+        n = con.execute("SELECT COUNT(*) FROM follows WHERE chat_id=?", (chat_id,)).fetchone()[0]
+        already = con.execute(
+            "SELECT 1 FROM follows WHERE chat_id=? AND url=?", (chat_id, url)
+        ).fetchone()
+        known = con.execute("SELECT title, last_count FROM shows WHERE url=?", (url,)).fetchone()
+    if already:
+        await reply(update, "You're already following that show.")
         return
-    row = con.execute("SELECT title, last_count FROM shows WHERE url=?", (url,)).fetchone()
-    if row:
-        title, count = row
+    if n >= MAX_FOLLOWS and not is_admin(update):
+        await reply(update, f"You can follow at most {MAX_FOLLOWS} shows.")
+        return
+
+    if known and known[1] is not None:
+        # Already tracked for someone else: no need to hit Pocket FM again.
+        title, count = known
     else:
         try:
-            title, count = await get_info(url)
+            html = await asyncio.to_thread(fetch, url)
+            title, count = find_episode_info(html)
         except Exception as e:
-            log.warning("follow fetch failed %s: %s", url, e)
-            await update.message.reply_text("I couldn't load that page. Check the link and try again.")
+            await reply(update, f"Couldn't load that page: {str(e)[:200]}")
             return
         if count is None:
-            await update.message.reply_text(
-                "I opened the page but couldn't read an episode count, so I can't track this one."
+            await reply(
+                update,
+                "I loaded the page but couldn't find an episode count, so I can't track it reliably.",
             )
             return
+
+    with closing(db()) as con, con:
+        con.execute("INSERT OR IGNORE INTO follows (chat_id, url) VALUES (?, ?)", (chat_id, url))
         con.execute(
-            "INSERT OR IGNORE INTO shows (url, title, last_count, last_checked) VALUES (?,?,?,?)",
-            (url, title, count, int(time.time())),
+            "INSERT OR IGNORE INTO shows (url, title, last_count, last_checked, fail_count) "
+            "VALUES (?,?,?,?,0)",
+            (url, title, count, now()),
         )
-    con.execute("INSERT INTO follows VALUES (?, ?)", (chat_id, url))
-    con.commit()
-    await update.message.reply_text(f"Following: {title}\nCurrent episodes: {count}\nI'll alert you about new ones.")
+        row = con.execute("SELECT title, last_count FROM shows WHERE url=?", (url,)).fetchone()
+    await reply(update, f"Following: {row[0]}\nCurrent episodes: {row[1]}")
 
 
-@track
-async def unfollow(update, ctx):
+def _user_follows(chat_id: int):
+    with closing(db()) as con:
+        return con.execute(
+            "SELECT s.title, s.last_count, s.url FROM follows f JOIN shows s ON s.url=f.url "
+            "WHERE f.chat_id=? ORDER BY s.title COLLATE NOCASE",
+            (chat_id,),
+        ).fetchall()
+
+
+@registered
+async def unfollow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text("Usage: /unfollow <series link>")
+        await reply(update, "Usage: /unfollow <link or number from /list>")
         return
-    url = normalize(ctx.args[0])
-    con = db()
-    cur = con.execute("DELETE FROM follows WHERE chat_id=? AND url=?", (update.effective_chat.id, url))
-    con.execute("DELETE FROM shows WHERE url NOT IN (SELECT url FROM follows)")  # drop unwatched shows
-    con.commit()
-    await update.message.reply_text("Unfollowed." if cur.rowcount else "You weren't following that link.")
+    chat_id = update.effective_chat.id
+    arg = ctx.args[0]
+    if arg.isdigit():
+        rows = _user_follows(chat_id)
+        idx = int(arg)
+        if not 1 <= idx <= len(rows):
+            await reply(update, "No show with that number. Check /list.")
+            return
+        url = rows[idx - 1][2]
+    else:
+        url = normalize_url(arg)
+    with closing(db()) as con, con:
+        removed = con.execute(
+            "DELETE FROM follows WHERE chat_id=? AND url=?", (chat_id, url)
+        ).rowcount
+        con.execute("DELETE FROM shows WHERE url NOT IN (SELECT url FROM follows)")
+    await reply(update, "Done." if removed else "You weren't following that link.")
 
 
-@track
-async def list_follows(update, ctx):
-    rows = db().execute(
-        "SELECT s.title, s.last_count, s.url FROM follows f JOIN shows s ON s.url=f.url WHERE f.chat_id=?",
-        (update.effective_chat.id,),
-    ).fetchall()
+@registered
+async def list_follows(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rows = _user_follows(update.effective_chat.id)
     if not rows:
-        await update.message.reply_text("You're not following anything yet. Try /follow <series link>.")
+        await reply(update, "You're not following anything yet.")
         return
-    limit = get_limit(db(), update.effective_chat.id)
-    body = "\n\n".join(f"{t} ({c} eps)\n{u}" for t, c, u in rows)
-    await update.message.reply_text(f"Following {len(rows)}/{limit}\n\n{body}")
+    text = "\n\n".join(f"{i}. {t} ({c} eps)\n{u}" for i, (t, c, u) in enumerate(rows, 1))
+    await reply(update, text + "\n\nStop tracking: /unfollow <number>")
 
 
-@track
-async def requestmore(update, ctx):
-    if not ADMIN_IDS:
-        await update.message.reply_text("Sorry, the admin can't be reached right now.")
-        return
-    u, chat = update.effective_user, update.effective_chat
-    con = db()
-    n = con.execute("SELECT COUNT(*) FROM follows WHERE chat_id=?", (chat.id,)).fetchone()[0]
-    reason = " ".join(ctx.args).strip()[:300]
-    await notify_admins(
-        ctx,
-        f"Limit request from {chat.id} (@{u.username or '-'})\n"
-        f"Using {n}/{get_limit(con, chat.id)}\n"
-        + (f"Reason: {reason}\n" if reason else "")
-        + f"Approve with: /setlimit {chat.id} <new limit>",
-    )
-    await update.message.reply_text("Request sent to the admin. You'll be told if it's approved.")
+# ---------- admin commands ----------
 
-
-# ---------------- admin commands ----------------
 ADMIN_HELP = (
     "Admin commands:\n"
-    "/stats - overview of users, shows, alerts, uptime\n"
-    "/users - recent users and follow counts\n"
-    "/shows - most followed shows and failing ones\n"
+    "/stats - bot statistics\n"
+    "/users - recent users\n"
+    "/userinfo <chat_id> - details and follows of one user\n"
+    "/shows - tracked shows and health\n"
     "/broadcast <text> - message all users\n"
-    "/setlimit <chat_id> <n> - set a user's series limit (/setlimit <chat_id> default resets it)\n"
-    "/forcesub on|off - turn the channel requirement on or off\n"
     "/ban <chat_id> - block a user\n"
     "/unban <chat_id> - unblock a user\n"
-    "/debug <series link> - show what the scraper detects"
+    "/removeshow <link> - delete a show and its follows\n"
+    "/forcecheck - poll all shows now\n"
+    "/debug <link> - show what the scraper detects\n"
+    "/backup - send the database file"
 )
 
 
 @admin_only
-async def adminhelp(update, ctx):
-    await update.message.reply_text(ADMIN_HELP)
-
-
-def fmt_uptime(sec):
-    d, r = divmod(int(sec), 86400)
-    h, r = divmod(r, 3600)
-    return f"{d}d {h}h {r // 60}m"
+async def adminhelp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await reply(update, ADMIN_HELP)
 
 
 @admin_only
-async def stats(update, ctx):
-    con = db()
-    day = int(time.time()) - 86400
-    q = lambda sql, *a: con.execute(sql, a).fetchone()[0]
-    msg = (
+async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    with closing(db()) as con:
+        q = lambda sql, *a: con.execute(sql, a).fetchone()[0]  # noqa: E731
+        users = q("SELECT COUNT(*) FROM users")
+        banned = q("SELECT COUNT(*) FROM users WHERE banned=1")
+        blocked = q("SELECT COUNT(*) FROM users WHERE blocked=1")
+        active = q("SELECT COUNT(*) FROM users WHERE last_seen>?", now() - 86400)
+        new_week = q("SELECT COUNT(*) FROM users WHERE first_seen>?", now() - 7 * 86400)
+        follows = q("SELECT COUNT(*) FROM follows")
+        shows = q("SELECT COUNT(*) FROM shows")
+        failing = q("SELECT COUNT(*) FROM shows WHERE fail_count>=?", FAIL_ALERT_THRESHOLD)
+        alerts = int(meta_get(con, "alerts_sent", 0))
+        polls = int(meta_get(con, "polls_run", 0))
+        last_poll = int(meta_get(con, "last_poll_at", 0))
+        last_dur = float(meta_get(con, "last_poll_seconds", 0))
+        last_alerts = int(meta_get(con, "last_poll_alerts", 0))
+        last_failed = int(meta_get(con, "last_poll_failed", 0))
+    size_kb = os.path.getsize(DB_PATH) // 1024 if os.path.exists(DB_PATH) else 0
+    await reply(
+        update,
         "Bot stats\n"
-        f"Uptime: {fmt_uptime(time.time() - STARTED_AT)}\n"
-        f"Users: {q('SELECT COUNT(*) FROM users')} "
-        f"(active 24h: {q('SELECT COUNT(*) FROM users WHERE last_seen>?', day)}, "
-        f"new 24h: {q('SELECT COUNT(*) FROM users WHERE first_seen>?', day)}, "
-        f"banned: {q('SELECT COUNT(*) FROM users WHERE banned=1')})\n"
-        f"Force-sub: {FORCE_SUB_CHANNEL or 'disabled'} ({'ON' if forcesub_enabled(con) else 'OFF'})\n"
-        f"Shows tracked: {q('SELECT COUNT(*) FROM shows')}\n"
-        f"Total follows: {q('SELECT COUNT(*) FROM follows')}\n"
-        f"Alerts sent: {meta(con, 'alerts_sent')}\n"
-        f"Poll cycles: {meta(con, 'polls')}\n"
-        f"Fetch errors: {meta(con, 'fetch_errors')}\n"
-        f"Commands handled: {meta(con, 'commands_total')}"
+        f"Uptime: {fmt_duration(time.time() - START_TIME)}\n"
+        f"Poll interval: {POLL_MINUTES} min\n\n"
+        f"Users: {users} (active 24h: {active}, new 7d: {new_week})\n"
+        f"Banned: {banned}, blocked the bot: {blocked}\n"
+        f"Follows: {follows}\n"
+        f"Shows tracked: {shows} (failing: {failing})\n\n"
+        f"Alerts sent (total): {alerts}\n"
+        f"Polls run: {polls}\n"
+        f"Last poll: {fmt_ago(last_poll)}, took {last_dur:.1f}s, "
+        f"{last_alerts} alerts, {last_failed} failed\n"
+        f"Database: {size_kb} KB",
     )
-    await update.message.reply_text(msg)
 
 
 @admin_only
-async def users(update, ctx):
-    rows = db().execute(
-        "SELECT u.chat_id, u.username, u.banned, COUNT(f.url), u.follow_limit FROM users u "
-        "LEFT JOIN follows f ON f.chat_id=u.chat_id GROUP BY u.chat_id "
-        "ORDER BY u.last_seen DESC LIMIT 25"
-    ).fetchall()
-    lines = [
-        f"{cid} @{un or '-'} follows:{n}/{lim if lim is not None else DEFAULT_FOLLOW_LIMIT}"
-        f"{' [BANNED]' if b else ''}"
-        for cid, un, b, n, lim in rows
-    ]
-    await update.message.reply_text("Recent users:\n" + ("\n".join(lines) or "none"))
-
-
-@admin_only
-async def shows_cmd(update, ctx):
-    con = db()
-    top = con.execute(
-        "SELECT s.title, COUNT(f.chat_id) c FROM shows s LEFT JOIN follows f ON f.url=s.url "
-        "GROUP BY s.url ORDER BY c DESC LIMIT 10"
-    ).fetchall()
-    bad = con.execute("SELECT title, fails FROM shows WHERE fails>0 ORDER BY fails DESC LIMIT 10").fetchall()
-    msg = "Top shows:\n" + ("\n".join(f"{c} - {t[:60]}" for t, c in top) or "none")
-    if bad:
-        msg += "\n\nFailing shows:\n" + "\n".join(f"{f} fails - {t[:60]}" for t, f in bad)
-    await update.message.reply_text(msg)
-
-
-@admin_only
-async def broadcast(update, ctx):
-    text = " ".join(ctx.args).strip()
-    if not text:
-        await update.message.reply_text("Usage: /broadcast <message>")
+async def users_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    with closing(db()) as con:
+        rows = con.execute(
+            "SELECT u.chat_id, u.username, u.first_name, u.banned, u.blocked, u.last_seen, "
+            "(SELECT COUNT(*) FROM follows f WHERE f.chat_id=u.chat_id) "
+            "FROM users u ORDER BY u.last_seen DESC LIMIT 30"
+        ).fetchall()
+    if not rows:
+        await reply(update, "No users yet.")
         return
-    con = db()
-    ids = [r[0] for r in con.execute("SELECT chat_id FROM users WHERE banned=0")]
-    ok = fail = 0
-    for cid in ids:
-        try:
-            await ctx.bot.send_message(cid, text)
-            ok += 1
-        except TelegramError:
-            fail += 1
-        await asyncio.sleep(0.05)  # stay under Telegram rate limits
-    await update.message.reply_text(f"Broadcast done. Sent: {ok}, failed: {fail}")
+    lines = []
+    for cid, uname, fname, banned, blocked, seen, nf in rows:
+        name = f"@{uname}" if uname else (fname or "?")
+        flag = (" [BANNED]" if banned else "") + (" [BLOCKED BOT]" if blocked else "")
+        lines.append(f"{cid} {name} - {nf} follows, seen {fmt_ago(seen)}{flag}")
+    await reply(update, "Latest 30 users:\n" + "\n".join(lines))
 
 
-async def _set_ban(update, ctx, value):
+@admin_only
+async def userinfo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args or not ctx.args[0].lstrip("-").isdigit():
-        await update.message.reply_text("Usage: /ban <chat_id>  or  /unban <chat_id>")
+        await reply(update, "Usage: /userinfo <chat_id>")
         return
-    con = db()
-    cur = con.execute("UPDATE users SET banned=? WHERE chat_id=?", (value, int(ctx.args[0])))
-    con.commit()
-    await update.message.reply_text("Done." if cur.rowcount else "No such user.")
+    cid = int(ctx.args[0])
+    with closing(db()) as con:
+        u = con.execute(
+            "SELECT username, first_name, first_seen, last_seen, banned, blocked, commands_used "
+            "FROM users WHERE chat_id=?",
+            (cid,),
+        ).fetchone()
+    if not u:
+        await reply(update, "No such user.")
+        return
+    uname, fname, first, last, banned, blocked, used = u
+    rows = _user_follows(cid)
+    shows = "\n".join(f"- {t} ({c} eps)" for t, c, _ in rows) or "- none"
+    await reply(
+        update,
+        f"User {cid}\nName: {fname or '?'} {('@' + uname) if uname else ''}\n"
+        f"First seen: {fmt_ago(first)}\nLast seen: {fmt_ago(last)}\n"
+        f"Commands used: {used or 0}\nBanned: {bool(banned)}, blocked bot: {bool(blocked)}\n\n"
+        f"Follows ({len(rows)}):\n{shows}",
+    )
 
 
 @admin_only
-async def setlimit(update, ctx):
-    if len(ctx.args) != 2 or not ctx.args[0].lstrip("-").isdigit() or not (
-        ctx.args[1].isdigit() or ctx.args[1].lower() == "default"
-    ):
-        await update.message.reply_text("Usage: /setlimit <chat_id> <number|default>")
+async def shows_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    with closing(db()) as con:
+        rows = con.execute(
+            "SELECT s.title, s.url, s.last_count, s.fail_count, s.last_checked, s.last_error, "
+            "(SELECT COUNT(*) FROM follows f WHERE f.url=s.url) AS n "
+            "FROM shows s ORDER BY n DESC, s.fail_count DESC LIMIT 25"
+        ).fetchall()
+    if not rows:
+        await reply(update, "No shows tracked.")
         return
-    chat_id = int(ctx.args[0])
-    new = None if ctx.args[1].lower() == "default" else min(int(ctx.args[1]), 1000)
-    con = db()
-    cur = con.execute("UPDATE users SET follow_limit=? WHERE chat_id=?", (new, chat_id))
-    con.commit()
-    if not cur.rowcount:
-        await update.message.reply_text("No such user (they must have used the bot at least once).")
-        return
-    shown = new if new is not None else DEFAULT_FOLLOW_LIMIT
-    await update.message.reply_text(f"Limit for {chat_id} set to {shown}.")
-    try:
-        await ctx.bot.send_message(chat_id, f"Your series limit is now {shown}.")
-    except TelegramError:
-        pass
+    lines = []
+    for title, url, count, fails, checked, err, n in rows:
+        line = f"{(title or '?')[:50]}\n{url}\n{count} eps, {n} followers, checked {fmt_ago(checked)}"
+        if fails:
+            line += f"\nFAILING x{fails}: {err or 'unknown'}"
+        lines.append(line)
+    await reply(update, "\n\n".join(lines))
+
+
+async def _do_broadcast(bot, admin_chat: int, text: str):
+    with closing(db()) as con:
+        ids = [r[0] for r in con.execute("SELECT chat_id FROM users WHERE banned=0 AND COALESCE(blocked,0)=0")]
+    ok = blocked = failed = 0
+    for cid in ids:
+        status = await safe_send(bot, cid, text)
+        if status == "ok":
+            ok += 1
+        elif status == "blocked":
+            blocked += 1
+            drop_chat(cid)
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)  # stay well under Telegram's rate limits
+    await safe_send(bot, admin_chat, f"Broadcast done. Sent: {ok}, blocked: {blocked}, failed: {failed}")
 
 
 @admin_only
-async def forcesub_cmd(update, ctx):
-    con = db()
-    if not FORCE_SUB_CHANNEL:
-        await update.message.reply_text("No channel configured (FORCE_SUB_CHANNEL is empty).")
+async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await reply(update, "Usage: /broadcast <message>")
         return
-    arg = ctx.args[0].lower() if ctx.args else ""
-    if arg in ("on", "off"):
-        con.execute("INSERT INTO meta VALUES ('forcesub_off', ?) ON CONFLICT(key) DO UPDATE SET value=?",
-                    (0 if arg == "on" else 1,) * 2)
-        con.commit()
-    state = "ON" if forcesub_enabled(con) else "OFF"
-    await update.message.reply_text(f"Force-subscribe to {FORCE_SUB_CHANNEL} is {state}.\nUsage: /forcesub on|off")
+    with closing(db()) as con:
+        n = con.execute("SELECT COUNT(*) FROM users WHERE banned=0 AND COALESCE(blocked,0)=0").fetchone()[0]
+    await reply(update, f"Sending to {n} users...")
+    # Run in the background so the bot stays responsive during large broadcasts.
+    ctx.application.create_task(_do_broadcast(ctx.bot, update.effective_chat.id, text))
+
+
+async def _set_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE, value: int):
+    verb = "ban" if value else "unban"
+    if not ctx.args or not ctx.args[0].lstrip("-").isdigit():
+        await reply(update, f"Usage: /{verb} <chat_id>")
+        return
+    cid = int(ctx.args[0])
+    if cid in ADMIN_IDS:
+        await reply(update, "You can't do that to an admin.")
+        return
+    with closing(db()) as con, con:
+        cur = con.execute("UPDATE users SET banned=? WHERE chat_id=?", (value, cid))
+    await reply(update, f"{verb.capitalize()}ned {cid}." if cur.rowcount else "No such user.")
 
 
 @admin_only
-async def ban(update, ctx):
+async def ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _set_ban(update, ctx, 1)
 
 
 @admin_only
-async def unban(update, ctx):
+async def unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _set_ban(update, ctx, 0)
 
 
 @admin_only
-async def debug(update, ctx):
-    if not ctx.args or not is_pocketfm(ctx.args[0]):
-        await update.message.reply_text("Usage: /debug <pocketfm series link>")
+async def removeshow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await reply(update, "Usage: /removeshow <link>")
+        return
+    url = normalize_url(ctx.args[0])
+    with closing(db()) as con, con:
+        f = con.execute("DELETE FROM follows WHERE url=?", (url,)).rowcount
+        s = con.execute("DELETE FROM shows WHERE url=?", (url,)).rowcount
+    await reply(update, f"Removed {s} show and {f} follows." if s else "Show not found.")
+
+
+@admin_only
+async def forcecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if POLL_LOCK.locked():
+        await reply(update, "A check is already running.")
+        return
+    await reply(update, "Checking all shows now...")
+    r = await poll_once(ctx.bot)
+    await reply(
+        update,
+        f"Done in {r['seconds']:.1f}s. Checked: {r['checked']}, failed: {r['failed']}, alerts sent: {r['alerts']}",
+    )
+
+
+@admin_only
+async def debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args or not valid(ctx.args[0]):
+        await reply(update, "Usage: /debug <pocketfm show link>")
         return
     try:
-        html = await asyncio.to_thread(fetch, ctx.args[0])
+        html = await asyncio.to_thread(fetch, normalize_url(ctx.args[0]))
     except Exception as e:
-        await update.message.reply_text(f"Fetch failed: {e}")
+        await reply(update, f"Fetch failed: {str(e)[:300]}")
         return
     _, blobs = extract_json_blobs(html)
     title, count = find_episode_info(html)
-    hits = [
-        f"{name}: {path} = {val}"
-        for name, blob in blobs
-        for path, val in _walk(blob)
-        if re.search(r"episode|count|total", path, re.I) and not isinstance(val, str)
-    ]
+    hits = []
+    for name, blob in blobs:
+        for path, val in _walk(blob):
+            if re.search(r"episode|count|total", path, re.I) and not isinstance(val, str):
+                hits.append(f"{name}: {path} = {val}")
     msg = f"Title: {title}\nDetected count: {count}\nJSON blobs: {[n for n, _ in blobs]}\n"
-    msg += "\n".join(hits[:25]) or "No episode-like fields found."
-    await update.message.reply_text(msg[:4000])
+    msg += "\n".join(hits[:25]) or "No episode-like fields found in embedded JSON."
+    await reply(update, msg)
 
 
-# ---------------- polling ----------------
-async def notify_admins(ctx, text):
-    for a in ADMIN_IDS:
-        try:
-            await ctx.bot.send_message(a, text)
-        except TelegramError:
-            pass
+@admin_only
+async def backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    tmp = os.path.join(BASE_DIR, f"backup-{now()}.db")
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as src, closing(sqlite3.connect(tmp)) as dst:
+            src.backup(dst)
+        with open(tmp, "rb") as f:
+            await update.message.reply_document(f, filename=f"pocketfm_bot-{time.strftime('%Y%m%d-%H%M%S')}.db")
+    except Exception as e:
+        await reply(update, f"Backup failed: {str(e)[:200]}")
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
-async def poll(ctx: ContextTypes.DEFAULT_TYPE):
-    con = db()
-    bump(con, "polls")
-    con.commit()
-    shows = con.execute("SELECT url, title, last_count, fails FROM shows").fetchall()
-    for url, title, last, fails in shows:
-        try:
-            _, count = await get_info(url)
-            if count is None:
-                raise ValueError("episode count not found")
-        except Exception as e:
-            log.warning("poll failed %s: %s", url, e)
-            fails += 1
-            con.execute("UPDATE shows SET fails=?, last_checked=? WHERE url=?", (fails, int(time.time()), url))
-            bump(con, "fetch_errors")
-            con.commit()
-            if fails == FAILS_BEFORE_ADMIN_ALERT:
-                await notify_admins(ctx, f"Warning: {title} failed {fails} checks in a row.\n{url}\n{e}")
-            await asyncio.sleep(FETCH_DELAY_SECONDS)
-            continue
+# ---------- polling ----------
 
-        con.execute("UPDATE shows SET fails=0, last_checked=? WHERE url=?", (int(time.time()), url))
-        if count > last:
-            con.execute("UPDATE shows SET last_count=? WHERE url=?", (count, url))
-            con.commit()
-            chats = [r[0] for r in con.execute(
-                "SELECT f.chat_id FROM follows f JOIN users u ON u.chat_id=f.chat_id "
-                "WHERE f.url=? AND u.banned=0", (url,))]
-            for chat in chats:
-                if forcesub_enabled(con) and not await is_member(ctx.bot, chat, ctx):
-                    continue  # left the channel: alerts paused until they rejoin
-                try:
-                    await ctx.bot.send_message(
-                        chat, f"New episode alert: {title}\n+{count - last} (now {count} episodes)\n{url}"
+async def poll_once(bot) -> dict:
+    """Check every tracked show once. Returns a summary dict."""
+    async with POLL_LOCK:
+        t0 = time.time()
+        checked = failed = alerts = 0
+        with closing(db()) as con:
+            shows = con.execute(
+                "SELECT url, title, last_count, COALESCE(fail_count,0), COALESCE(drop_hits,0) FROM shows"
+            ).fetchall()
+
+        for url, title, last, fails, drop_hits in shows:
+            error, count = None, None
+            try:
+                html = await asyncio.to_thread(fetch, url)
+                _, count = find_episode_info(html)
+                if count is None:
+                    error = "episode count not found on page"
+            except Exception as e:
+                error = str(e)[:200]
+            checked += 1
+
+            if error:
+                failed += 1
+                fails += 1
+                with closing(db()) as con, con:
+                    con.execute(
+                        "UPDATE shows SET fail_count=?, last_error=?, last_checked=? WHERE url=?",
+                        (fails, error, now(), url),
                     )
-                    bump(con, "alerts_sent")
-                except Forbidden:  # user blocked the bot: clean up their follows
-                    con.execute("DELETE FROM follows WHERE chat_id=?", (chat,))
-                except TelegramError as e:
-                    log.warning("send failed to %s: %s", chat, e)
-                await asyncio.sleep(0.05)
-        con.commit()
-        await asyncio.sleep(FETCH_DELAY_SECONDS)
-    con.execute("DELETE FROM shows WHERE url NOT IN (SELECT url FROM follows)")
-    con.commit()
+                log.warning("check failed for %s (%dx): %s", url, fails, error)
+                if fails == FAIL_ALERT_THRESHOLD:
+                    await notify_admins(bot, f"Show failing {fails} checks in a row:\n{title}\n{url}\n{error}")
+            else:
+                if fails >= FAIL_ALERT_THRESHOLD:
+                    await notify_admins(bot, f"Show recovered:\n{title}\n{url}")
+
+                new_count, new_drop = count, 0
+                if last is not None and count < last:
+                    # Pages sometimes render partial data. Only trust a lower count if it repeats.
+                    new_drop = drop_hits + 1
+                    if new_drop < DROP_CONFIRM_CHECKS:
+                        new_count = last
+                        log.info("lower count for %s (%s < %s), waiting for confirmation", url, count, last)
+                    else:
+                        new_drop = 0
+                with closing(db()) as con, con:
+                    con.execute(
+                        "UPDATE shows SET fail_count=0, last_error=NULL, last_checked=?, "
+                        "last_count=?, drop_hits=? WHERE url=?",
+                        (now(), new_count, new_drop, url),
+                    )
+
+                if last is not None and count > last:
+                    new = count - last
+                    with closing(db()) as con:
+                        chats = [
+                            r[0]
+                            for r in con.execute(
+                                "SELECT f.chat_id FROM follows f LEFT JOIN users u ON u.chat_id=f.chat_id "
+                                "WHERE f.url=? AND COALESCE(u.banned,0)=0 AND COALESCE(u.blocked,0)=0",
+                                (url,),
+                            )
+                        ]
+                    for chat in chats:
+                        status = await safe_send(
+                            bot, chat, f"New episode alert: {title}\n+{new} (now {count} episodes)\n{url}"
+                        )
+                        if status == "ok":
+                            alerts += 1
+                        elif status == "blocked":
+                            drop_chat(chat)
+                        await asyncio.sleep(0.05)
+            await asyncio.sleep(FETCH_DELAY_SECONDS)
+
+        seconds = time.time() - t0
+        with closing(db()) as con, con:
+            meta_inc(con, "polls_run")
+            meta_inc(con, "alerts_sent", alerts)
+            meta_set(con, "last_poll_at", now())
+            meta_set(con, "last_poll_seconds", round(seconds, 2))
+            meta_set(con, "last_poll_alerts", alerts)
+            meta_set(con, "last_poll_failed", failed)
+        return {"checked": checked, "failed": failed, "alerts": alerts, "seconds": seconds}
+
+
+async def poll_job(ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        await poll_once(ctx.bot)
+    except Exception:
+        log.exception("poll failed")
+
+
+# ---------- startup / errors ----------
+
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    if isinstance(ctx.error, NetworkError):
+        log.warning("Network error: %s", ctx.error)  # transient, don't spam tracebacks or users
+        return
+    log.error("Unhandled error", exc_info=ctx.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("Something went wrong. Please try again later.")
+    except Exception:
+        pass
+
+
+async def post_init(app: Application):
+    user_cmds = [
+        BotCommand("follow", "Follow a Pocket FM show"),
+        BotCommand("unfollow", "Stop following a show"),
+        BotCommand("list", "Show what you follow"),
+        BotCommand("help", "How to use this bot"),
+    ]
+    admin_cmds = user_cmds + [
+        BotCommand("stats", "Bot statistics"),
+        BotCommand("users", "Recent users"),
+        BotCommand("userinfo", "Details of one user"),
+        BotCommand("shows", "Tracked shows"),
+        BotCommand("broadcast", "Message all users"),
+        BotCommand("ban", "Ban a user"),
+        BotCommand("unban", "Unban a user"),
+        BotCommand("removeshow", "Remove a show"),
+        BotCommand("forcecheck", "Poll all shows now"),
+        BotCommand("debug", "Debug scraper on a link"),
+        BotCommand("backup", "Send database backup"),
+        BotCommand("adminhelp", "Admin command list"),
+    ]
+    try:
+        await app.bot.set_my_commands(user_cmds)
+        for aid in ADMIN_IDS:
+            try:
+                await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(aid))
+            except Exception as e:
+                log.warning("couldn't set admin commands for %s: %s", aid, e)
+    except Exception as e:
+        log.warning("set_my_commands failed: %s", e)
+    if NOTIFY_ON_START:
+        await notify_admins(app.bot, f"Bot started. Polling every {POLL_MINUTES} min.")
 
 
 def main():
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN is not set. Put it in .env or export it.")
     if not ADMIN_IDS:
-        log.warning("ADMIN_IDS not set: admin commands are disabled.")
-    app = Application.builder().token(BOT_TOKEN).build()
+        log.warning("ADMIN_IDS is empty: admin commands are disabled.")
+
+    db().close()  # create/migrate the database at startup
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .concurrent_updates(True)  # a slow command (/forcecheck, /follow) must not block everyone else
+        .build()
+    )
+    if app.job_queue is None:
+        raise SystemExit('Job queue missing. Run: pip install "python-telegram-bot[job-queue]"')
+
     for name, fn in [
-        ("start", start), ("help", help_cmd), ("follow", follow), ("unfollow", unfollow),
-        ("list", list_follows), ("requestmore", requestmore), ("setlimit", setlimit), ("forcesub", forcesub_cmd),
-        ("adminhelp", adminhelp), ("stats", stats), ("users", users),
-        ("shows", shows_cmd), ("broadcast", broadcast), ("ban", ban), ("unban", unban),
-        ("debug", debug),
+        ("start", start), ("help", start), ("follow", follow), ("unfollow", unfollow),
+        ("list", list_follows), ("adminhelp", adminhelp), ("stats", stats), ("users", users_cmd),
+        ("userinfo", userinfo), ("shows", shows_cmd), ("broadcast", broadcast), ("ban", ban),
+        ("unban", unban), ("removeshow", removeshow), ("forcecheck", forcecheck),
+        ("debug", debug), ("backup", backup),
     ]:
         app.add_handler(CommandHandler(name, fn))
-    app.add_handler(CallbackQueryHandler(checksub_callback, pattern="^checksub$"))
-    app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=30, job_kwargs={"max_instances": 1})
-    app.run_polling()
+    app.add_error_handler(on_error)
+
+    app.job_queue.run_repeating(
+        poll_job,
+        interval=POLL_MINUTES * 60,
+        first=30,
+        job_kwargs={"max_instances": 1, "coalesce": True},
+    )
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
