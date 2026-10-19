@@ -1,0 +1,3 @@
+python-telegram-bot[job-queue]>=20
+requests
+beautifulsoup4
